@@ -5,7 +5,7 @@ Speciality: Instead of manually controlling lights…The system can automaticall
 
 FEATURES 
 
-Nabila 
+Nabela Islam
  1. Dual Mode System (Manual + Auto AI)
 What happens:
 Press key:
@@ -51,7 +51,7 @@ C → change camera
 
 
 
-Member 2 – 
+Member 2 – Mohammad Abtahi Kafil Chy
 
 1. Multi-direction Car Movement
  What it means:
@@ -104,7 +104,7 @@ AI adjusts signal timing based on weather conditions.
 
 
 
-Member 3 –
+Member 3 – Ahnaf Al Muhsee
 
 1. Score System (Traffic Efficiency Score)
 
