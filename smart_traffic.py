@@ -3,405 +3,805 @@ from OpenGL.GLUT import *
 from OpenGL.GLU import *
 import math
 import random
+import sys
+import time
 
-W_WIDTH, W_HEIGHT = 1000, 800
+WINDOW_WIDTH = 1200
+WINDOW_HEIGHT = 850
 
-# --- NABILA: GLOBAL MODES & AI ---
-auto_mode = True
-camera_mode = 0  # 0: Top View, 1: Driver View, 2: Intersection Close View
-time_count = 0
-tracked_car_id = None
-cam_offset_x = 0
-cam_offset_y = 0
+DIRECTIONS = ["EAST", "WEST", "NORTH", "SOUTH"]
+DIR_LABELS = {
+    "EAST": "Left -> Right",
+    "WEST": "Right -> Left",
+    "NORTH": "Down -> Up",
+    "SOUTH": "Up -> Down",
+}
 
-# 0: N/S Green & E/W Red
-# 1: E/W Green & N/S Red
-lights_phase = 0 
-light_timer = 300
-base_green_time = 300
+SPAWN_POINTS = {
+    "EAST": (-620.0, -35.0, 0.0),
+    "WEST": (620.0, 35.0, 180.0),
+    "NORTH": (35.0, -620.0, 90.0),
+    "SOUTH": (-35.0, 620.0, -90.0),
+}
+
+LANE_OFFSETS = [-35.0, -5.0]
+LANE_NAMES = ["Lane 1", "Lane 2"]
+STOP_LINE = 128.0
+ROAD_LIMIT = 680.0
+INTERSECTION_HALF = 95.0
+MIN_SPAWN_GAP = 135.0
+MIN_FOLLOW_GAP = 82.0
+QUEUE_GAP = 78.0
+
+WEATHERS = ["CLEAR", "RAIN", "FOG"]
+WEATHER_SPEED = {"CLEAR": 1.0, "RAIN": 0.65, "FOG": 0.78}
+WEATHER_GREEN_BONUS = {"CLEAR": 0.0, "RAIN": 3.0, "FOG": 2.0}
 
 cars = []
-lane_density = {'N': 0, 'S': 0, 'E': 0, 'W': 0}
+density_history = {direction: [] for direction in DIRECTIONS}
+signals = {direction: "RED" for direction in DIRECTIONS}
 
-ROAD_WIDTH = 100
-STOP_LINE = 60 # Where cars wait for red lights
+mode = "AUTO"
+active_green = "EAST"
+green_timer = 0.0
+green_duration = 6.0
+spawn_timer = 0.0
+simulation_time = 0.0
+last_time = 0.0
+score_timer = 0.0
+density_timer = 0.0
+score = 100
+violations = 0
+jam_warning = ""
+prediction_text = "Prediction: collecting data"
+weather = "CLEAR"
+camera_index = 0
+difficulty_level = 1
 
-def spawn_car(is_ambulance=False):
-    directions = ['N', 'S', 'E', 'W']
-    d = random.choice(directions)
-    
-    # Simple coordinates based on direction
-    if d == 'N': # Coming from North going South
-        x, y = -25, 800
-        dx, dy = 0, -1
-    elif d == 'S': # Coming from South going North
-        x, y = 25, -800
-        dx, dy = 0, 1
-    elif d == 'E': # Coming from East going West
-        x, y = 800, 25
-        dx, dy = -1, 0
-    else: # Coming from West going East
-        x, y = -800, -25
-        dx, dy = 1, 0
-        
-    speed = 1.2 if not is_ambulance else 3.5 # Slower traffic to allow queues to build
-    color = (1.0, 1.0, 1.0) if is_ambulance else (random.random(), random.random(), random.random())
-    
-    # Brake lights fix: if car is too dark, make it brighter
-    color = (max(0.2, color[0]), max(0.2, color[1]), max(0.2, color[2]))
-    
-    cars.append({
-        'dir': d,
-        'x': x, 'y': y,
-        'dx': dx, 'dy': dy,
-        'speed': speed,
-        'max_speed': speed,
-        'is_ambulance': is_ambulance,
-        'color': color,
-        'waiting': False
-    })
 
-# --- CORE UPDATE LOGIC ---
-def update_traffic_ai():
-    global light_timer, lights_phase
-    
-    # Calculate density directly via coordinates
-    lane_density['N'] = sum(1 for c in cars if c['dir'] == 'N' and c['y'] > 0 and c['waiting'])
-    lane_density['S'] = sum(1 for c in cars if c['dir'] == 'S' and c['y'] < 0 and c['waiting'])
-    lane_density['E'] = sum(1 for c in cars if c['dir'] == 'E' and c['x'] > 0 and c['waiting'])
-    lane_density['W'] = sum(1 for c in cars if c['dir'] == 'W' and c['x'] < 0 and c['waiting'])
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
-    if auto_mode:
-        # Nabila Feature 4: Emergency Vehicle Priority
-        ambulance_present = any(c['is_ambulance'] for c in cars)
-        if ambulance_present:
-            # Force light to Green for the ambulance's direction
-            amb_dir = next(c['dir'] for c in cars if c['is_ambulance'])
-            if amb_dir in ['N', 'S'] and lights_phase != 0:
-                lights_phase = 0
-                light_timer = 200
-            elif amb_dir in ['E', 'W'] and lights_phase != 1:
-                lights_phase = 1
-                light_timer = 200
-        else:
-            light_timer -= 1
-            if light_timer <= 0:
-                lights_phase = 1 - lights_phase # Swap
-                # Nabila Feature 2: Adaptive Signal Timing (AI Logic)
-                # If the new phase has heavily congested lanes, give it longer!
-                light_timer = base_green_time
-                
-                if lights_phase == 0: # N/S just turned green
-                    if lane_density['N'] > 3 or lane_density['S'] > 3:
-                        light_timer += 200 # Extended AI time
-                    elif lane_density['N'] == 0 and lane_density['S'] == 0:
-                        light_timer = 60 # Skip lane essentially
-                else: # E/W just turned green
-                    if lane_density['E'] > 3 or lane_density['W'] > 3:
-                        light_timer += 200 
-                    elif lane_density['E'] == 0 and lane_density['W'] == 0:
-                        light_timer = 60 
 
-def update_cars():
-    global cars
-    for i, c in enumerate(cars):
-        c['waiting'] = False
-        
-        # Determine if facing a Red Light at the stop line
-        facing_red = False
-        if c['dir'] in ['N', 'S'] and lights_phase == 1: facing_red = True
-        if c['dir'] in ['E', 'W'] and lights_phase == 0: facing_red = True
-        
-        # Only stop if we haven't crossed yet
-        is_approaching = False
-        if c['dir'] == 'N' and c['y'] > 0: is_approaching = True
-        if c['dir'] == 'S' and c['y'] < 0: is_approaching = True
-        if c['dir'] == 'E' and c['x'] > 0: is_approaching = True
-        if c['dir'] == 'W' and c['x'] < 0: is_approaching = True
+def weather_effect_text():
+    if weather == "RAIN":
+        return "Rain slows cars"
+    if weather == "FOG":
+        return "Fog reduces visibility"
+    return "Clear weather gives normal speed"
 
-        dist_to_intersection = abs(c['y']) if c['dir'] in ['N', 'S'] else abs(c['x'])
-        
-        # Stop at intersection
-        if facing_red and is_approaching and STOP_LINE < dist_to_intersection < STOP_LINE + 30:
-            c['speed'] = 0
-            c['waiting'] = True
-        else:
-            # Brake logic to avoid hitting car in front
-            # Look ahead for cars in the same direction
-            front_car_dist = 9999
-            for other in cars:
-                if other is c: continue
-                if other['dir'] == c['dir']:
-                    # Compute distance ahead
-                    if c['dir'] == 'N' and other['y'] < c['y'] and other['y'] > c['y'] - 120:
-                        front_car_dist = min(front_car_dist, c['y'] - other['y'])
-                    elif c['dir'] == 'S' and other['y'] > c['y'] and other['y'] < c['y'] + 120:
-                        front_car_dist = min(front_car_dist, other['y'] - c['y'])
-                    elif c['dir'] == 'E' and other['x'] < c['x'] and other['x'] > c['x'] - 120:
-                        front_car_dist = min(front_car_dist, c['x'] - other['x'])
-                    elif c['dir'] == 'W' and other['x'] > c['x'] and other['x'] < c['x'] + 120:
-                        front_car_dist = min(front_car_dist, other['x'] - c['x'])
-            
-            # Maintain gaps from cars
-            if front_car_dist < 52: # Safe gap preventing modeling clipping
-                c['speed'] = 0
-                c['waiting'] = True
-            else:
-                # Regain speed safely
-                c['speed'] += 0.1
-                if c['speed'] > c['max_speed']: c['speed'] = c['max_speed']
-        
-        c['x'] += c['dx'] * c['speed']
-        c['y'] += c['dy'] * c['speed']
-        
-    # Remove exited cars
-    cars = [c for c in cars if -900 < c['x'] < 900 and -900 < c['y'] < 900]
 
-# --- DRAWING ROUTINES ---
-def draw_glued_car(car):
-    glPushMatrix()
-    glTranslatef(car['x'], car['y'], 10)
-    
-    # Align to direction
-    if car['dir'] == 'N': glRotatef(180, 0, 0, 1) # N spawns facing -Y
-    elif car['dir'] == 'S': glRotatef(0, 0, 0, 1) # S spawns facing +Y
-    elif car['dir'] == 'E': glRotatef(90, 0, 0, 1) # E spawns facing -X
-    elif car['dir'] == 'W': glRotatef(-90, 0, 0, 1) # W spawns facing +X
-    
-    # Chassis
-    glColor3f(*car['color'])
-    glScalef(2.0, 4.0, 1.2)
-    glutSolidCube(10)
-    
-    # Roof/Windows
-    glColor3f(0.1, 0.1, 0.1) # Dark windows
-    glTranslatef(0, 0, 4)
-    glScalef(0.8, 0.5, 1.0)
-    glutSolidCube(10)
-    
-    if car['is_ambulance']:
-        # Ambulance Siren
-        pulse = abs(math.sin(time_count * 0.2))
-        glColor3f(1.0, 0.0, 0.0) if pulse > 0.5 else glColor3f(0.0, 0.0, 1.0)
-        glTranslatef(0, 0, 6)
-        glutSolidCube(5)
-        
-    glPopMatrix()
-
-def draw_environment():
-    # Draw Roads
-    glColor3f(0.15, 0.15, 0.15)
-    glBegin(GL_QUADS)
-    # Vertical Road (N/S)
-    glVertex3f(-ROAD_WIDTH/2, 1000, 0); glVertex3f(ROAD_WIDTH/2, 1000, 0)
-    glVertex3f(ROAD_WIDTH/2, -1000, 0); glVertex3f(-ROAD_WIDTH/2, -1000, 0)
-    # Horizontal Road (E/W)
-    glVertex3f(-1000, ROAD_WIDTH/2, 0); glVertex3f(1000, ROAD_WIDTH/2, 0)
-    glVertex3f(1000, -ROAD_WIDTH/2, 0); glVertex3f(-1000, -ROAD_WIDTH/2, 0)
-    glEnd()
-
-    # Draw Traffic Lights
-    def draw_signal(x, y, is_ns):
-        glPushMatrix()
-        glTranslatef(x, y, 30)
-        
-        # The pole
-        glColor3f(0.2, 0.2, 0.2)
-        glPushMatrix()
-        glScalef(0.2, 0.2, 6.0)
-        glutSolidCube(10)
-        glPopMatrix()
-        
-        # The light
-        glTranslatef(0, 0, 35)
-        
-        green_active = (lights_phase == 0 if is_ns else lights_phase == 1)
-        if green_active:
-            glColor3f(0.0, 1.0, 0.0) # Green
-        else:
-            glColor3f(1.0, 0.0, 0.0) # Red
-            
-        gluSphere(gluNewQuadric(), 8, 16, 16)
-        glPopMatrix()
-
-    # Place lights on 4 corners
-    draw_signal(-ROAD_WIDTH/2 - 20, ROAD_WIDTH/2 + 20, is_ns=False) # West stopping incoming East
-    draw_signal(ROAD_WIDTH/2 + 20, -ROAD_WIDTH/2 - 20, is_ns=False) # East stopping incoming West
-    draw_signal(-ROAD_WIDTH/2 - 20, -ROAD_WIDTH/2 - 20, is_ns=True) # South stopping incoming North
-    draw_signal(ROAD_WIDTH/2 + 20, ROAD_WIDTH/2 + 20, is_ns=True)   # North stopping incoming South
-
-# Nabila Feature 3: Real-Time Traffic UI & Manual Controls
-def draw_ui():
+def draw_text(x, y, text, font=GLUT_BITMAP_HELVETICA_18, color=(1.0, 1.0, 1.0)):
+    glColor3f(*color)
     glMatrixMode(GL_PROJECTION)
     glPushMatrix()
     glLoadIdentity()
-    gluOrtho2D(0, W_WIDTH, 0, W_HEIGHT)
+    gluOrtho2D(0, WINDOW_WIDTH, 0, WINDOW_HEIGHT)
     glMatrixMode(GL_MODELVIEW)
     glPushMatrix()
     glLoadIdentity()
-    
-    def render_text(x, y, text, font=GLUT_BITMAP_HELVETICA_18, color=(1,1,1)):
-        glColor3f(*color)
-        glRasterPos2f(x, y)
-        for ch in text:
-            glutBitmapCharacter(font, ord(ch))
-            
-    # Draw Dual Mode status
-    mode_text = "AUTO (AI CONTROL)" if auto_mode else "MANUAL CONTROL"
-    render_text(20, W_HEIGHT - 40, f"MODE: {mode_text}", color=(0.2, 1.0, 0.2) if auto_mode else (1.0, 0.5, 0.0))
-    render_text(20, W_HEIGHT - 65, "Press 'A' for Auto, 'M' for Manual, 'C' for Camera", GLUT_BITMAP_HELVETICA_12)
-    
-    # Real-Time Density
-    render_text(20, W_HEIGHT - 110, "REAL-TIME LANE DENSITY:", color=(0.8, 0.8, 1.0))
-    render_text(20, W_HEIGHT - 135, f"North Queue: {lane_density['N']} Cars", GLUT_BITMAP_HELVETICA_12)
-    render_text(20, W_HEIGHT - 155, f"South Queue: {lane_density['S']} Cars", GLUT_BITMAP_HELVETICA_12)
-    render_text(20, W_HEIGHT - 175, f"East Queue: {lane_density['E']} Cars", GLUT_BITMAP_HELVETICA_12)
-    render_text(20, W_HEIGHT - 195, f"West Queue: {lane_density['W']} Cars", GLUT_BITMAP_HELVETICA_12)
-
-    if not auto_mode:
-        # Draw explicit Manual Action buttons mapped structurally
-        glColor3f(0.2, 0.2, 0.2)
-        glBegin(GL_QUADS)
-        glVertex2f(30, 100); glVertex2f(230, 100); glVertex2f(230, 150); glVertex2f(30, 150)
-        glVertex2f(250, 100); glVertex2f(450, 100); glVertex2f(450, 150); glVertex2f(250, 150)
-        glEnd()
-        
-        tc_N = (0, 1, 0) if lights_phase == 0 else (1, 1, 1)
-        tc_E = (0, 1, 0) if lights_phase == 1 else (1, 1, 1)
-        
-        render_text(45, 120, "FORCE N/S GREEN", color=tc_N)
-        render_text(265, 120, "FORCE E/W GREEN", color=tc_E)
-        render_text(30, 160, "[CLICK BUTTONS TO CHANGE LIGHTS]", font=GLUT_BITMAP_HELVETICA_12)
-
-    if any(c['is_ambulance'] for c in cars):
-        render_text(W_WIDTH//2 - 100, W_HEIGHT - 50, "EMERGENCY: CLEARING ROADS!", color=(1.0, 0.0, 0.0))
-
+    glRasterPos2f(x, y)
+    for ch in text:
+        glutBitmapCharacter(font, ord(ch))
     glPopMatrix()
     glMatrixMode(GL_PROJECTION)
     glPopMatrix()
     glMatrixMode(GL_MODELVIEW)
 
-# --- APP SETUP ---
-def idle():
-    global time_count
-    time_count += 1
-    
-    # Increased spawn rate so the HUD stats gather clear big numbers
-    if random.random() < 0.035:
-        spawn_car()
-    if random.random() < 0.001:
-        spawn_car(is_ambulance=True)
-        
-    update_traffic_ai()
-    update_cars()
-    
+
+def set_material(color):
+    glColor3f(*color)
+
+
+def draw_cube(x, y, z, sx, sy, sz, color):
+    glPushMatrix()
+    glTranslatef(x, y, z)
+    glScalef(sx, sy, sz)
+    set_material(color)
+    glutSolidCube(1.0)
+    glPopMatrix()
+
+
+def draw_cylinder(x, y, z, radius, height, color):
+    glPushMatrix()
+    glTranslatef(x, y, z)
+    set_material(color)
+    quad = gluNewQuadric()
+    gluCylinder(quad, radius, radius, height, 16, 2)
+    glPopMatrix()
+
+
+def draw_sphere(x, y, z, radius, color):
+    glPushMatrix()
+    glTranslatef(x, y, z)
+    set_material(color)
+    quad = gluNewQuadric()
+    gluSphere(quad, radius, 18, 18)
+    glPopMatrix()
+
+
+def reset_signals():
+    for direction in DIRECTIONS:
+        signals[direction] = "RED"
+    signals[active_green] = "GREEN"
+
+
+def create_car(direction=None, emergency=False, lane=None):
+    if direction is None:
+        direction = random.choice(DIRECTIONS)
+    if lane is None:
+        lane = random.randrange(2)
+    sx, sy, angle = SPAWN_POINTS[direction]
+    sx, sy = lane_center(direction, lane, sx, sy)
+    return {
+        "x": sx,
+        "y": sy,
+        "z": 9.0,
+        "direction": direction,
+        "lane": lane,
+        "lane_name": LANE_NAMES[lane],
+        "angle": angle,
+        "speed": random.uniform(50.0, 78.0),
+        "wait": 0.0,
+        "emergency": emergency,
+        "color": (1.0, 1.0, 1.0) if emergency else random.choice(
+            [(0.1, 0.45, 1.0), (1.0, 0.18, 0.12), (0.95, 0.85, 0.15), (0.15, 0.8, 0.25), (0.9, 0.25, 0.85)]
+        ),
+        "violated": False,
+        "turn": random.choice(["straight", "straight", "straight", "left", "right"]),
+        "turned": False,
+        "clearing_intersection": False,
+    }
+
+
+def lane_center(direction, lane, x, y):
+    offset = LANE_OFFSETS[lane]
+    if direction == "EAST":
+        return x, -35.0 + offset * 1.0
+    if direction == "WEST":
+        return x, 35.0 - offset * 1.0
+    if direction == "NORTH":
+        return 35.0 - offset * 1.0, y
+    return -35.0 + offset * 1.0, y
+
+
+def lock_to_lane(car):
+    car["x"], car["y"] = lane_center(car["direction"], car["lane"], car["x"], car["y"])
+
+
+def reset_simulation():
+    global cars, signals, mode, active_green, green_timer, green_duration
+    global spawn_timer, simulation_time, last_time, score_timer, density_timer, score, violations
+    global jam_warning, prediction_text, weather, camera_index
+    global difficulty_level
+    cars = []
+    signals = {direction: "RED" for direction in DIRECTIONS}
+    mode = "AUTO"
+    active_green = "EAST"
+    green_timer = 0.0
+    green_duration = 6.0
+    spawn_timer = 0.0
+    simulation_time = 0.0
+    score_timer = 0.0
+    density_timer = 0.0
+    score = 100
+    violations = 0
+    jam_warning = ""
+    prediction_text = "Prediction: collecting data"
+    weather = "CLEAR"
+    camera_index = 0
+    difficulty_level = 1
+    last_time = time.perf_counter()
+    for direction in DIRECTIONS:
+        density_history[direction] = []
+    for _ in range(7):
+        add_car_with_gap()
+    reset_signals()
+
+
+def spawn_gap_clear(direction, lane):
+    sx, sy, _ = SPAWN_POINTS[direction]
+    sx, sy = lane_center(direction, lane, sx, sy)
+    for car in cars:
+        if car["direction"] == direction and car["lane"] == lane:
+            if abs(car["x"] - sx) + abs(car["y"] - sy) < MIN_SPAWN_GAP:
+                return False
+    return True
+
+
+def add_car_with_gap(emergency=False):
+    directions = DIRECTIONS[:]
+    random.shuffle(directions)
+    for direction in directions:
+        lanes = [0, 1]
+        random.shuffle(lanes)
+        for lane in lanes:
+            if emergency or spawn_gap_clear(direction, lane):
+                cars.append(create_car(direction, emergency, lane))
+                return True
+    return False
+
+
+def density_counts():
+    counts = {direction: 0 for direction in DIRECTIONS}
+    for car in cars:
+        if is_approaching_intersection(car):
+            counts[car["direction"]] += 1
+    return counts
+
+
+def is_approaching_intersection(car):
+    if car["direction"] == "EAST":
+        return car["x"] < STOP_LINE
+    if car["direction"] == "WEST":
+        return car["x"] > -STOP_LINE
+    if car["direction"] == "NORTH":
+        return car["y"] < STOP_LINE
+    return car["y"] > -STOP_LINE
+
+
+def before_stop_line(car):
+    if car["direction"] == "EAST":
+        return car["x"] <= -STOP_LINE
+    if car["direction"] == "WEST":
+        return car["x"] >= STOP_LINE
+    if car["direction"] == "NORTH":
+        return car["y"] <= -STOP_LINE
+    return car["y"] >= STOP_LINE
+
+
+def signed_position(car):
+    if car["direction"] == "EAST":
+        return car["x"]
+    if car["direction"] == "WEST":
+        return -car["x"]
+    if car["direction"] == "NORTH":
+        return car["y"]
+    return -car["y"]
+
+
+def stop_line_position(direction):
+    if direction in ("EAST", "NORTH"):
+        return -STOP_LINE
+    return -STOP_LINE
+
+
+def red_light_queue_target(car):
+    stop_target = stop_line_position(car["direction"])
+    same_lane_ahead = []
+    car_pos = signed_position(car)
+    for other in cars:
+        if other is car or other["direction"] != car["direction"] or other["lane"] != car["lane"]:
+            continue
+        other_pos = signed_position(other)
+        if car_pos < other_pos <= stop_target + 20:
+            same_lane_ahead.append(other_pos)
+    if not same_lane_ahead:
+        return stop_target
+    same_lane_ahead.sort()
+    return same_lane_ahead[0] - QUEUE_GAP
+
+
+def reached_queue_target(car):
+    return signed_position(car) >= red_light_queue_target(car)
+
+
+def will_reach_queue_target(car, distance):
+    if signals[car["direction"]] == "GREEN" or not before_stop_line(car):
+        return False
+    target = red_light_queue_target(car)
+    current = signed_position(car)
+    return current >= target or 0 <= target - current <= distance + 1.5
+
+
+def near_stop_line(car):
+    if car["direction"] == "EAST":
+        return -STOP_LINE - 30 < car["x"] < -STOP_LINE + 10
+    if car["direction"] == "WEST":
+        return STOP_LINE - 10 < car["x"] < STOP_LINE + 30
+    if car["direction"] == "NORTH":
+        return -STOP_LINE - 30 < car["y"] < -STOP_LINE + 10
+    return STOP_LINE - 10 < car["y"] < STOP_LINE + 30
+
+
+def emergency_direction():
+    for car in cars:
+        if car["emergency"] and is_approaching_intersection(car):
+            return car["direction"]
+    return None
+
+
+def choose_ai_signal():
+    counts = density_counts()
+    best_direction = active_green
+    best_score = -1.0
+    for direction in DIRECTIONS:
+        if counts[direction] == 0:
+            continue
+        waiting = sum(car["wait"] for car in cars if car["direction"] == direction)
+        long_waiting = sum(1 for car in cars if car["direction"] == direction and car["wait"] > 4.0)
+        fairness_bonus = 1.5 if direction != active_green else 0.0
+        lane_score = counts[direction] * 3.4 + waiting * 0.10 + long_waiting * 2.2 + fairness_bonus
+        if lane_score > best_score:
+            best_score = lane_score
+            best_direction = direction
+    if best_score < 0:
+        best_direction = DIRECTIONS[(DIRECTIONS.index(active_green) + 1) % len(DIRECTIONS)]
+    duration = clamp(4.0 + counts[best_direction] * 1.2 + WEATHER_GREEN_BONUS[weather], 4.0, 13.0)
+    return best_direction, duration
+
+
+def set_green(direction, duration=None):
+    global active_green, green_timer, green_duration
+    active_green = direction
+    green_timer = 0.0
+    if duration is not None:
+        green_duration = duration
+    reset_signals()
+
+
+def update_ai_signals(dt):
+    global green_timer
+    green_timer += dt
+    if mode == "AUTO" and green_timer >= green_duration:
+        direction, duration = choose_ai_signal()
+        set_green(direction, duration)
+
+
+def should_stop(car):
+    if car["emergency"]:
+        return False
+    if car.get("clearing_intersection"):
+        return False
+    if signals[car["direction"]] != "GREEN" and before_stop_line(car) and reached_queue_target(car):
+        return True
+    for other in cars:
+        if other is car or other["direction"] != car["direction"] or other["lane"] != car["lane"]:
+            continue
+        if distance_ahead(car, other) and abs(car["x"] - other["x"]) + abs(car["y"] - other["y"]) < MIN_FOLLOW_GAP:
+            return True
+    return False
+
+
+def distance_ahead(car, other):
+    if car["direction"] == "EAST":
+        return other["x"] > car["x"] and abs(other["y"] - car["y"]) < 16
+    if car["direction"] == "WEST":
+        return other["x"] < car["x"] and abs(other["y"] - car["y"]) < 16
+    if car["direction"] == "NORTH":
+        return other["y"] > car["y"] and abs(other["x"] - car["x"]) < 16
+    return other["y"] < car["y"] and abs(other["x"] - car["x"]) < 16
+
+
+def move_car(car, dt):
+    global score, violations
+    speed = car["speed"] * WEATHER_SPEED[weather] * (1.0 + difficulty_level * 0.035)
+    if car["emergency"]:
+        speed *= 1.28
+    distance = speed * dt
+    if not car["emergency"] and not car.get("clearing_intersection") and signals[car["direction"]] != "GREEN" and before_stop_line(car):
+        target = red_light_queue_target(car)
+        remaining = target - signed_position(car)
+        if will_reach_queue_target(car, distance):
+            place_car_at_signed_position(car, target)
+            car["wait"] += dt
+            return
+    stopped = should_stop(car)
+    if stopped:
+        car["wait"] += dt
+        return
+    if signals[car["direction"]] != "GREEN" and near_stop_line(car) and not car["violated"] and not car["emergency"]:
+        car["violated"] = True
+        violations += 1
+        score -= 8
+    car["wait"] = max(0.0, car["wait"] - dt)
+    if car["direction"] == "EAST":
+        car["x"] += distance
+    elif car["direction"] == "WEST":
+        car["x"] -= distance
+    elif car["direction"] == "NORTH":
+        car["y"] += distance
+    else:
+        car["y"] -= distance
+    lock_to_lane(car)
+    if car.get("clearing_intersection") and (abs(car["x"]) > STOP_LINE + 35 or abs(car["y"]) > STOP_LINE + 35):
+        car["clearing_intersection"] = False
+    if abs(car["x"]) < 72 and abs(car["y"]) < 72 and not car["turned"] and car["turn"] != "straight":
+        apply_turn(car)
+
+
+def place_car_at_signed_position(car, position):
+    if car["direction"] == "EAST":
+        car["x"] = position
+    elif car["direction"] == "WEST":
+        car["x"] = -position
+    elif car["direction"] == "NORTH":
+        car["y"] = position
+    else:
+        car["y"] = -position
+    lock_to_lane(car)
+
+
+def apply_turn(car):
+    car["turned"] = True
+    if car["turn"] == "left":
+        mapping = {"EAST": "NORTH", "NORTH": "WEST", "WEST": "SOUTH", "SOUTH": "EAST"}
+    else:
+        mapping = {"EAST": "SOUTH", "SOUTH": "WEST", "WEST": "NORTH", "NORTH": "EAST"}
+    car["direction"] = mapping[car["direction"]]
+    car["angle"] = SPAWN_POINTS[car["direction"]][2]
+    car["clearing_intersection"] = True
+    lock_to_lane(car)
+
+
+def remove_finished_cars():
+    global cars, score
+    kept = []
+    for car in cars:
+        outside = abs(car["x"]) > ROAD_LIMIT or abs(car["y"]) > ROAD_LIMIT
+        if outside:
+            score += 3 if not car["violated"] else 0
+            if car["emergency"]:
+                score += 15
+        else:
+            kept.append(car)
+    cars = kept
+
+
+def spawn_update(dt):
+    global spawn_timer, difficulty_level
+    spawn_timer += dt
+    difficulty_level = 1 + int(simulation_time // 35)
+    interval = clamp(2.1 - difficulty_level * 0.13, 0.65, 2.1)
+    if spawn_timer >= interval:
+        spawn_timer = 0.0
+        if len(cars) < 42:
+            add_car_with_gap()
+
+
+def update_density_history():
+    global jam_warning, prediction_text
+    counts = density_counts()
+    jams = []
+    for direction in DIRECTIONS:
+        density_history[direction].append(counts[direction])
+        if len(density_history[direction]) > 24:
+            density_history[direction].pop(0)
+        long_wait = sum(1 for car in cars if car["direction"] == direction and car["wait"] > 5.0)
+        if counts[direction] >= 7 or long_wait >= 4:
+            jams.append(direction)
+    if jams:
+        jam_warning = "Jam: " + ", ".join(jams)
+    else:
+        jam_warning = "Jam: none"
+    predicted = None
+    predicted_value = -999
+    for direction, history in density_history.items():
+        if len(history) >= 6:
+            trend = sum(history[-3:]) - sum(history[-6:-3])
+            if trend > predicted_value:
+                predicted_value = trend
+                predicted = direction
+    prediction_text = "Prediction: {} may get congested next".format(predicted) if predicted and predicted_value > 0 else "Prediction: stable traffic"
+
+
+def update_efficiency_score():
+    global score
+    counts = density_counts()
+    waiting_cars = sum(1 for car in cars if car["wait"] > 1.5)
+    jammed_cars = sum(1 for car in cars if car["wait"] > 5.0)
+    moving_cars = max(0, len(cars) - waiting_cars)
+    total_cars = max(1, len(cars))
+    moving_ratio = moving_cars / total_cars
+    worst_density = max(counts.values()) if counts else 0
+    severe_jam_limit = 5 + difficulty_level // 2
+    heavy_density_limit = 9 + difficulty_level
+    if moving_ratio >= 0.70 and moving_cars >= 3:
+        score += 4
+    elif moving_ratio >= 0.50:
+        score += 2
+    elif jammed_cars >= severe_jam_limit or worst_density >= heavy_density_limit:
+        score -= 2
+    else:
+        score += 1
+
+
+def update_simulation():
+    global last_time, simulation_time, score_timer, density_timer, score
+    now = time.perf_counter()
+    dt = clamp(now - last_time, 0.0, 0.05)
+    last_time = now
+    simulation_time += dt
+    score_timer += dt
+    density_timer += dt
+    update_ai_signals(dt)
+    spawn_update(dt)
+    for car in cars:
+        move_car(car, dt)
+    remove_finished_cars()
+    if density_timer >= 1.0:
+        density_timer = 0.0
+        update_density_history()
+    if score_timer >= 1.0:
+        score_timer = 0.0
+        update_efficiency_score()
+    score = clamp(score, 0, 9999)
     glutPostRedisplay()
 
-def showScreen():
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-    glLoadIdentity()
 
-    # Nabila Feature 5: Camera View Modes
+def idle():
+    update_simulation()
+
+
+def setup_camera():
     glMatrixMode(GL_PROJECTION)
     glLoadIdentity()
-    gluPerspective(60, W_WIDTH/W_HEIGHT, 0.1, 4500)
+    gluPerspective(62.0, WINDOW_WIDTH / float(WINDOW_HEIGHT), 1.0, 2500.0)
     glMatrixMode(GL_MODELVIEW)
     glLoadIdentity()
+    if camera_index == 0:
+        gluLookAt(0, -760, 620, 0, 0, 0, 0, 0, 1)
+    elif camera_index == 1:
+        gluLookAt(-70, -390, 95, 0, 80, 25, 0, 0, 1)
+    else:
+        gluLookAt(310, -360, 250, 0, 0, 0, 0, 0, 1)
 
-    if camera_mode == 0:
-        # Map Style Top View - Now supports Arrow Key Panning
-        gluLookAt(cam_offset_x, cam_offset_y, 1200, cam_offset_x, cam_offset_y, 0, 0, 1, 0)
-    elif camera_mode == 1:
-        # Driver Perspective (Chase Cam)
-        global tracked_car_id
-        tracked_car = None
-        for c in cars:
-            if id(c) == tracked_car_id:
-                tracked_car = c
-                break
-                
-        # Find a new car if current is invalid, or if it crosses the 750 bounds boundary
-        if not tracked_car or abs(tracked_car['x']) > 750 or abs(tracked_car['y']) > 750:
-            # Pick a car heavily approaching the intersection so we get a good view of the queue
-            candidates = [c for c in cars if 300 < max(abs(c['x']), abs(c['y'])) < 750]
-            if candidates:
-                tracked_car = random.choice(candidates)
-                tracked_car_id = id(tracked_car)
-            elif cars:
-                tracked_car = cars[0]
-                tracked_car_id = id(tracked_car)
-                
-        if tracked_car:
-            c = tracked_car
-            # Position the camera slightly behind and above the roof
-            gluLookAt(c['x'] - c['dx']*45, c['y'] - c['dy']*45, 35, 
-                      c['x'] + c['dx']*200, c['y'] + c['dy']*200, 10, 
-                      0, 0, 1)
-        else:
-            # Fallback when there are literally no cars on map
-            gluLookAt(0, -500, 100, 0, 0, 0, 0, 0, 1)
-    elif camera_mode == 2:
-        # Intersection Close View - Supports Panning alongside the core
-        gluLookAt(-350 + cam_offset_x, -350 + cam_offset_y, 480, cam_offset_x, cam_offset_y, 0, 0, 0, 1)
 
-    draw_environment()
-    for c in cars: draw_glued_car(c)
-    draw_ui()
+def draw_ground():
+    night_factor = (math.sin(simulation_time * 0.025) + 1.0) * 0.5
+    sky_brightness = 0.42 + night_factor * 0.35
+    fog_color = (0.62, 0.66, 0.68, 1.0) if weather == "FOG" else (0.20 + sky_brightness * 0.45, 0.27 + sky_brightness * 0.45, 0.36 + sky_brightness * 0.55, 1.0)
+    glClearColor(*fog_color)
+    draw_cube(0, 0, -2, 1400, 1400, 4, (0.18, 0.42, 0.2))
+    draw_cube(0, 0, 0, 1420, 185, 3, (0.48, 0.48, 0.45))
+    draw_cube(0, 0, 0, 185, 1420, 3, (0.48, 0.48, 0.45))
+    draw_cube(0, 0, 0, 1400, 150, 2, (0.08, 0.08, 0.08))
+    draw_cube(0, 0, 1, 150, 1400, 2, (0.08, 0.08, 0.08))
+    draw_cube(0, 0, 2, 180, 180, 2, (0.1, 0.1, 0.1))
+    for pos in range(-560, 600, 90):
+        if abs(pos) > 110:
+            draw_cube(pos, 0, 4, 36, 4, 2, (1, 1, 0.15))
+            draw_cube(0, pos, 4, 4, 36, 2, (1, 1, 0.15))
+    for offset in [-64, 64]:
+        draw_cube(0, offset, 5, 1400, 2, 2, (1, 1, 1))
+        draw_cube(offset, 0, 5, 2, 1400, 2, (1, 1, 1))
+    for offset in LANE_OFFSETS:
+        draw_cube(0, -35.0 + offset, 6, 1400, 1.4, 2, (0.25, 0.25, 0.25))
+        draw_cube(0, 35.0 - offset, 6, 1400, 1.4, 2, (0.25, 0.25, 0.25))
+        draw_cube(35.0 - offset, 0, 6, 1.4, 1400, 2, (0.25, 0.25, 0.25))
+        draw_cube(-35.0 + offset, 0, 6, 1.4, 1400, 2, (0.25, 0.25, 0.25))
+    draw_cube(-128, -76, 6, 6, 145, 3, (1.0, 1.0, 1.0))
+    draw_cube(128, 76, 6, 6, 145, 3, (1.0, 1.0, 1.0))
+    draw_cube(76, -128, 6, 145, 6, 3, (1.0, 1.0, 1.0))
+    draw_cube(-76, 128, 6, 145, 6, 3, (1.0, 1.0, 1.0))
+    for pos in [-470, -250, 250, 470]:
+        draw_cube(pos, -70, 6, 24, 8, 2, (1.0, 1.0, 1.0))
+        draw_cube(pos + 14, -70, 6, 8, 18, 2, (1.0, 1.0, 1.0))
+        draw_cube(pos, 70, 6, 24, 8, 2, (1.0, 1.0, 1.0))
+        draw_cube(pos - 14, 70, 6, 8, 18, 2, (1.0, 1.0, 1.0))
+        draw_cube(-70, pos, 6, 8, 24, 2, (1.0, 1.0, 1.0))
+        draw_cube(-70, pos + 14, 6, 18, 8, 2, (1.0, 1.0, 1.0))
+        draw_cube(70, pos, 6, 8, 24, 2, (1.0, 1.0, 1.0))
+        draw_cube(70, pos - 14, 6, 18, 8, 2, (1.0, 1.0, 1.0))
 
+
+def draw_buildings():
+    locations = [(-360, -330), (-520, 260), (350, 310), (520, -260), (-270, 420), (290, -430), (-610, -500), (610, 500)]
+    for index, (x, y) in enumerate(locations):
+        height = 90 + (index % 3) * 45
+        width = 80 + (index % 2) * 25
+        depth = 80 + (index % 4) * 12
+        draw_cube(x, y, height / 2, width, depth, height, (0.28 + index * 0.025, 0.31, 0.39))
+        draw_cube(x, y - depth / 2 - 2, height + 8, width + 5, 5, 16, (0.75, 0.85, 1.0))
+        for row in range(3, int(height), 28):
+            for col in [-0.25, 0.25]:
+                lit = (index + row) % 3 != 0
+                window_color = (1.0, 0.86, 0.35) if lit else (0.08, 0.1, 0.14)
+                draw_cube(x + col * width, y - depth / 2 - 4, row, 12, 3, 10, window_color)
+
+
+def draw_tree(x, y):
+    draw_cube(x, y, 18, 10, 10, 36, (0.38, 0.20, 0.08))
+    draw_sphere(x, y, 48, 25, (0.05, 0.38, 0.12))
+    draw_sphere(x - 12, y + 6, 40, 18, (0.07, 0.45, 0.15))
+    draw_sphere(x + 12, y - 8, 42, 18, (0.04, 0.32, 0.10))
+
+
+def draw_street_lamp(x, y):
+    draw_cube(x, y, 38, 6, 6, 76, (0.08, 0.08, 0.08))
+    draw_cube(x + 16, y, 76, 32, 5, 5, (0.08, 0.08, 0.08))
+    draw_sphere(x + 32, y, 72, 8, (1.0, 0.88, 0.35))
+
+
+def draw_city_details():
+    for x in [-560, -390, -220, 220, 390, 560]:
+        draw_tree(x, -125)
+        draw_tree(x, 125)
+    for y in [-560, -390, -220, 220, 390, 560]:
+        draw_tree(-125, y)
+        draw_tree(125, y)
+    for x, y in [(-185, -185), (185, -185), (-185, 185), (185, 185), (-520, -105), (520, 105), (-105, 520), (105, -520)]:
+        draw_street_lamp(x, y)
+    draw_cube(-185, -185, 18, 50, 18, 36, (0.10, 0.16, 0.22))
+    draw_cube(185, 185, 18, 50, 18, 36, (0.10, 0.16, 0.22))
+    draw_cube(-185, -185, 40, 46, 4, 10, (0.05, 0.25, 0.9))
+    draw_cube(185, 185, 40, 46, 4, 10, (0.9, 0.18, 0.05))
+
+
+def draw_traffic_light(direction, x, y, angle=0.0):
+    glPushMatrix()
+    glTranslatef(x, y, 0)
+    glRotatef(angle, 0, 0, 1)
+    draw_cube(0, 0, 4, 34, 34, 8, (0.02, 0.02, 0.02))
+    draw_cube(0, 0, 55, 12, 12, 110, (0.03, 0.03, 0.03))
+    draw_cube(0, 0, 122, 42, 24, 64, (0.01, 0.01, 0.01))
+    state = signals[direction]
+    red = (1.0, 0.05, 0.03) if state == "RED" else (0.18, 0.0, 0.0)
+    yellow = (1.0, 0.85, 0.05) if state == "YELLOW" else (0.18, 0.14, 0.0)
+    green = (0.0, 1.0, 0.1) if state == "GREEN" else (0.0, 0.16, 0.0)
+    draw_sphere(0, -13, 140, 9, red)
+    draw_sphere(0, -13, 122, 9, yellow)
+    draw_sphere(0, -13, 104, 9, green)
+    if state == "RED":
+        draw_sphere(0, -15, 140, 14, (0.45, 0.02, 0.02))
+    elif state == "GREEN":
+        draw_sphere(0, -15, 104, 14, (0.02, 0.45, 0.04))
+    draw_cube(0, -17, 104, 32, 3, 58, (0.0, 0.0, 0.0))
+    glPopMatrix()
+
+
+def draw_overhead_signal(direction, x, y, angle):
+    glPushMatrix()
+    glTranslatef(x, y, 0)
+    glRotatef(angle, 0, 0, 1)
+    draw_cube(0, 0, 70, 10, 10, 140, (0.03, 0.03, 0.03))
+    draw_cube(45, 0, 136, 90, 8, 8, (0.03, 0.03, 0.03))
+    draw_traffic_light(direction, 86, 0, 90)
+    glPopMatrix()
+
+
+def draw_all_lights():
+    draw_traffic_light("EAST", -155, -112, 0)
+    draw_traffic_light("WEST", 155, 112, 180)
+    draw_traffic_light("NORTH", 112, -155, 90)
+    draw_traffic_light("SOUTH", -112, 155, -90)
+    draw_traffic_light("EAST", -155, 112, 0)
+    draw_traffic_light("WEST", 155, -112, 180)
+    draw_traffic_light("NORTH", -112, -155, 90)
+    draw_traffic_light("SOUTH", 112, 155, -90)
+    draw_overhead_signal("EAST", -210, -72, 0)
+    draw_overhead_signal("WEST", 210, 72, 180)
+    draw_overhead_signal("NORTH", 72, -210, 90)
+    draw_overhead_signal("SOUTH", -72, 210, -90)
+
+
+def draw_car(car):
+    glPushMatrix()
+    glTranslatef(car["x"], car["y"], car["z"])
+    glRotatef(car["angle"], 0, 0, 1)
+    body = (1.0, 1.0, 1.0) if car["emergency"] else car["color"]
+    draw_cube(0, 0, 8, 42, 24, 16, body)
+    draw_cube(2, 0, 22, 24, 18, 12, (0.12, 0.18, 0.25))
+    draw_cube(-17, -13, 2, 8, 5, 5, (0.02, 0.02, 0.02))
+    draw_cube(17, -13, 2, 8, 5, 5, (0.02, 0.02, 0.02))
+    draw_cube(-17, 13, 2, 8, 5, 5, (0.02, 0.02, 0.02))
+    draw_cube(17, 13, 2, 8, 5, 5, (0.02, 0.02, 0.02))
+    if car["emergency"]:
+        draw_cube(0, 0, 32, 20, 7, 6, (1, 0, 0))
+        draw_cube(0, -13, 15, 5, 3, 10, (1, 0, 0))
+    if car["violated"]:
+        draw_cube(0, 0, 42, 12, 12, 4, (1, 0, 0))
+    glPopMatrix()
+
+
+def draw_weather():
+    if weather == "RAIN":
+        glColor3f(0.45, 0.65, 1.0)
+        glLineWidth(2)
+        glBegin(GL_LINES)
+        for _ in range(520):
+            x = random.uniform(-1100, 1100)
+            y = random.uniform(-1100, 1100)
+            z = random.uniform(40, 760)
+            glVertex3f(x, y, z)
+            glVertex3f(x + 18, y - 15, z - 70)
+        glEnd()
+        glLineWidth(1)
+    elif weather == "FOG":
+        glColor3f(0.80, 0.82, 0.84)
+        glBegin(GL_QUADS)
+        for z in (35, 75, 115, 155, 195, 235, 275, 340, 420):
+            glVertex3f(-1200, -1200, z)
+            glVertex3f(1200, -1200, z)
+            glVertex3f(1200, 1200, z)
+            glVertex3f(-1200, 1200, z)
+        glEnd()
+        glColor3f(0.62, 0.64, 0.66)
+        glBegin(GL_LINES)
+        for _ in range(220):
+            y = random.uniform(-1100, 1100)
+            z = random.uniform(40, 430)
+            glVertex3f(-1100, y, z)
+            glVertex3f(1100, y + random.uniform(-55, 55), z + random.uniform(-18, 18))
+        glEnd()
+
+
+def draw_hud():
+    counts = density_counts()
+    y = WINDOW_HEIGHT - 28
+    draw_text(18, y, "AI Smart Traffic Control System - Adaptive City Simulation", color=(0.2, 1.0, 0.5))
+    y -= 28
+    draw_text(18, y, "Mode: {} | Green: {} | Timer: {:.1f}/{:.1f} | Weather: {} | Camera: {}".format(mode, active_green, green_timer, green_duration, weather, camera_index + 1))
+    y -= 24
+    draw_text(18, y, "Weather Effect: {} | AI green bonus: +{:.1f}s".format(weather_effect_text(), WEATHER_GREEN_BONUS[weather]))
+    y -= 24
+    draw_text(18, y, "Density EAST:{} WEST:{} NORTH:{} SOUTH:{} | Cars:{} | Difficulty:{}".format(counts["EAST"], counts["WEST"], counts["NORTH"], counts["SOUTH"], len(cars), difficulty_level))
+    y -= 24
+    emergency = emergency_direction()
+    emergency_text = "Ambulance active: {} road, signals unchanged".format(emergency) if emergency else "Ambulance active: none"
+    draw_text(18, y, "Score: {} | Violations: {} | {} | {} | {}".format(score, violations, jam_warning, emergency_text, prediction_text), color=(1.0, 0.9, 0.3))
+    y -= 24
+    draw_text(18, y, "Controls: A Auto, M Manual, 1-4 Green, C Camera, W Weather, E Ambulance, R Reset, ESC Exit")
+    if mode == "AUTO":
+        draw_text(18, 110, "Auto mode Is On", font=GLUT_BITMAP_HELVETICA_18, color=(0.1, 1.0, 0.2))
+
+
+def display():
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    setup_camera()
+    draw_weather()
+    draw_ground()
+    draw_buildings()
+    draw_city_details()
+    draw_all_lights()
+    for car in cars:
+        draw_car(car)
+    draw_hud()
     glutSwapBuffers()
 
-def keyboardListener(key, x, y):
-    global auto_mode, camera_mode
-    if key == b'a' or key == b'A':
-        auto_mode = True
-    elif key == b'm' or key == b'M':
-        auto_mode = False
-    elif key == b'c' or key == b'C':
-        global cam_offset_x, cam_offset_y
-        camera_mode = (camera_mode + 1) % 3
-        cam_offset_x = 0
-        cam_offset_y = 0
+
+def keyboard(key, x, y):
+    global mode, camera_index, weather
+    normalized = key.decode("utf-8").lower() if isinstance(key, bytes) else str(key).lower()
+    if normalized == "\x1b":
+        glutLeaveMainLoop()
+        return
+    if normalized == "a":
+        mode = "AUTO"
+    elif normalized == "m":
+        mode = "MANUAL"
+    elif normalized in ("1", "2", "3", "4"):
+        mode = "MANUAL"
+        set_green(DIRECTIONS[int(normalized) - 1], 9999.0)
+    elif normalized == "c":
+        camera_index = (camera_index + 1) % 3
+    elif normalized == "w":
+        weather = WEATHERS[(WEATHERS.index(weather) + 1) % len(WEATHERS)]
+    elif normalized == "e":
+        add_car_with_gap(True)
+    elif normalized == "r":
+        reset_simulation()
     glutPostRedisplay()
 
-def specialKeyListener(key, x, y):
-    global cam_offset_x, cam_offset_y
-    if key == GLUT_KEY_UP:
-        cam_offset_y += 35
-    elif key == GLUT_KEY_DOWN:
-        cam_offset_y -= 35
-    elif key == GLUT_KEY_LEFT:
-        cam_offset_x -= 35
-    elif key == GLUT_KEY_RIGHT:
-        cam_offset_x += 35
-    glutPostRedisplay()
 
-def mouseListener(button, state, x, y):
-    global lights_phase
-    # Map orthographic click since UI is top-left pinned mathematically
-    # Y is inverted in GLUT (0 is top)
-    real_y = W_HEIGHT - y
-    if button == GLUT_LEFT_BUTTON and state == GLUT_DOWN and not auto_mode:
-        if 30 <= x <= 230 and 100 <= real_y <= 150:
-            lights_phase = 0 # Force N/S
-        elif 250 <= x <= 450 and 100 <= real_y <= 150:
-            lights_phase = 1 # Force E/W
-            
+def init_gl():
+    pass
+
+
 def main():
-    glutInit()
-    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH)
-    glutInitWindowSize(W_WIDTH, W_HEIGHT)
-    glutInitWindowPosition(100, 10)
-    glutCreateWindow(b"AI Smart Traffic Control System")
-
-    glEnable(GL_DEPTH_TEST)
-
-    glutDisplayFunc(showScreen)
-    glutKeyboardFunc(keyboardListener)
-    glutSpecialFunc(specialKeyListener)
-    glutMouseFunc(mouseListener)
+    glutInit(sys.argv)
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH)
+    glutInitWindowSize(WINDOW_WIDTH, WINDOW_HEIGHT)
+    glutInitWindowPosition(40, 20)
+    glutCreateWindow(b"AI Smart Traffic Control System - 3D Adaptive City Simulation")
+    init_gl()
+    reset_simulation()
+    glutDisplayFunc(display)
+    glutKeyboardFunc(keyboard)
     glutIdleFunc(idle)
-
     glutMainLoop()
+
 
 if __name__ == "__main__":
     main()
+
